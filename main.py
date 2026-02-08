@@ -25,6 +25,7 @@ import logging
 from datetime import datetime
 import unicodedata
 import platform
+import html
 
 # Setup logging
 logging.basicConfig(
@@ -56,8 +57,31 @@ BRANDING_LOGO_PATH = os.getenv('BRANDING_LOGO_PATH', None)
 IMAGE_OUTPUT_FOLDER = "transformed_images"
 BLOG_OUTPUT_FOLDER = "blog_drafts"
 
+def get_positive_int_env(var_name, default_value):
+    """Read positive integer from environment; fallback to default on invalid input."""
+    raw_value = os.getenv(var_name, "")
+    if not raw_value:
+        return default_value
+
+    try:
+        value = int(raw_value)
+        if value <= 0:
+            raise ValueError
+        return value
+    except ValueError:
+        logger.warning(f"Invalid {var_name}='{raw_value}'. Falling back to {default_value}.")
+        return default_value
+
+MAX_CATEGORIES_PER_RUN = get_positive_int_env("MAX_CATEGORIES_PER_RUN", 1)
+
 # --- BLOGGER AUTHENTICATION CONFIGURATION ---
 BLOGGER_BLOG_ID = os.getenv('BLOGGER_BLOG_ID', '2033568692716180894') # Apni blog ID yahan daalo, ya .env mein.
+BLOGGER_POST_STATUS = os.getenv('BLOGGER_POST_STATUS', 'DRAFT').upper()
+if BLOGGER_POST_STATUS not in {'LIVE', 'DRAFT'}:
+    logger.warning(
+        f"Invalid BLOGGER_POST_STATUS='{BLOGGER_POST_STATUS}'. Falling back to 'DRAFT'."
+    )
+    BLOGGER_POST_STATUS = 'DRAFT'
 
 # These will hold the JSON strings directly from GitHub Secrets OR be read from local files
 # In GitHub Actions, these will be populated from secrets.
@@ -221,9 +245,10 @@ def get_blogger_oauth_credentials():
 
     if creds and creds.valid:
         logger.info("INFO: Valid Blogger OAuth credentials obtained successfully.")
-    else:
-        logger.error("ERROR: Could not obtain valid Blogger OAuth credentials. Posting to Blogger will likely fail.")
-    return creds
+        return creds
+
+    logger.error("ERROR: Could not obtain valid Blogger OAuth credentials. Posting to Blogger will fail.")
+    return None
 
 def validate_environment():
     """Validate that all required environment variables and dependencies are set"""
@@ -233,7 +258,7 @@ def validate_environment():
         errors.append("GNEWS_API_KEY not found in environment variables.")
 
     if not GEMINI_API_KEY:
-        errors.append("GEMINI_API_KEY not found in environment variables. Gemini functions will be skipped.")
+        logger.warning("GEMINI_API_KEY not found in environment variables. AI generation will be skipped.")
 
     # Validate Blogger API credentials
     if not BLOGGER_BLOG_ID:
@@ -267,6 +292,43 @@ def sanitize_filename(filename):
     safe_title = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in filename).strip()
     safe_title = re.sub(r'[_ -]+', '_', safe_title).lower() # Ensure single underscores and lowercase
     return safe_title[:100] # Truncate to a reasonable length for file paths
+
+def parse_metadata_list_field(raw_value):
+    """
+    Parse metadata list fields that are expected in format: [value1, value2]
+    """
+    if not raw_value:
+        return []
+
+    value = raw_value.strip()
+    if value.startswith('[') and value.endswith(']'):
+        value = value[1:-1]
+
+    items = []
+    for item in value.split(','):
+        cleaned = item.strip().strip('"').strip("'")
+        if cleaned:
+            items.append(cleaned)
+
+    return items
+
+def sanitize_external_url(url, allow_data=False):
+    """
+    Allow only safe URL schemes for generated HTML links and images.
+    """
+    if not url:
+        return ''
+
+    cleaned = url.strip()
+    if re.match(r'^https?://', cleaned, re.IGNORECASE):
+        return cleaned
+    if allow_data and cleaned.startswith('data:image/'):
+        return cleaned
+    if re.match(r'^mailto:', cleaned, re.IGNORECASE):
+        return cleaned
+
+    logger.warning(f"Blocked potentially unsafe URL scheme: {cleaned[:80]}")
+    return '#'
 
 def fetch_gnews_articles(category, max_articles_to_fetch=10, max_retries=3):
     """Fetches articles from GNews API with retry logic"""
@@ -914,15 +976,15 @@ def generate_content_agent(consolidated_article_data, research_output, transform
         f"2.  `research_output`: {json.dumps(research_output, indent=2)}\n"
         f"3.  `transformed_image_path_info`: '{image_path_for_prompt}' (This is the file path to the main featured image. Do NOT embed this image again within the content body. It will be handled separately in the HTML template.)\n\n"
         f"## Content Specifications:\n"
-        f"-   **Word Count:** Aim for 2500-3000 words. Synthesize and expand thoughtfully on the `aggregated_source_data['combined_content']`, adding depth, specific (even if fabricated) details, and related information from your training data. Do NOT simply copy-paste content from the input. Rewrite and integrate.\n"
+        f"-   **Word Count:** Aim for 2500-3000 words. Synthesize and expand thoughtfully on the `aggregated_source_data['combined_content']`, adding depth and concrete explanations. Do NOT simply copy-paste content from the input. Rewrite and integrate.\n"
         f"-   **Heading Structure:** Use the provided outline (`research_output['blog_outline']`). Ensure a minimum of 25 headings (`##` and `###` only, except for the main H1 title).\n"
         f"-   **Paragraph Length:** Each paragraph should contain at least 5 sentences for comprehensive coverage, unless it's a short intro/outro or a bullet point explanation.\n"
         f"-   **Writing Style:** Professional yet conversational, engaging, and human-like. Avoid jargon where simpler terms suffice. Do NOT mention that you are an AI or generated the content. Ensure a clear, authoritative, and trustworthy tone that positions the content as highly credible.\n"
         f"-   **Target Audience:** Broad audience interested in the specified category.\n"
         f"-   **Keyword Integration:** Naturally weave `primary_keywords` ({primary_keywords_str}) and `secondary_keywords` ({secondary_keywords_str}) throughout the text without keyword stuffing. Integrate them into headings, subheadings, and body paragraphs.\n"
         f"-   **Content Expansion:** Elaborate significantly on the `aggregated_source_data['combined_content']` by adding specific details, explanations, and context, drawing from your extensive knowledge base. Emphasize synthesizing information from *all provided sources* to create a unique and comprehensive article.\n"
-        f"-   **Data & Examples:** Incorporate relevant data, statistics, and real-world examples (even if not in original article, create plausible ones). Invent realistic numbers, dates, names, and organizations where appropriate to enhance credibility. Ensure these details *support* the main points derived from the aggregated content. When inventing details or examples, ensure they are realistic and enhance the article's depth and plausibility.\n"
-        f"-   **Linking:** Generate relevant external links where appropriate (e.g., `[Source Name](https://www.reputable-source.com/article-about-topic)`). **Crucially, ensure these are actual, plausible URLs from reputable domains related to the topic (e.g., 'nytimes.com/tech-news', 'theverge.com/reviews', 'medicaljournals.org/research', 'forbes.com/business-insights', 'espn.com/sports-analysis'). Invent these URLs realistically and embed them naturally within the surrounding sentences. Do NOT use the `@` symbol or any other prefix before links or raw URLs. Do NOT include `example.com` or similar placeholder domains.** Also, generate **2-3 contextually relevant internal links** within the content, pointing to hypothetical related blog posts on your own blog (e.g., `[Benefits of Cloud Adoption](https://yourblog.blogspot.com/2024/05/cloud-adoption-benefits.html)`, `[Latest Trends in Renewable Energy](https://yourblog.blogspot.com/2024/05/renewable-energy-trends.html)`). These internal links should be naturally embedded within sentences and promote exploration of related content on your site.\n"
+        f"-   **Data & Examples:** Incorporate relevant data, statistics, and real-world examples only when they can be grounded in reliable public reporting or the provided source material. Do NOT fabricate facts, numbers, names, dates, studies, or organizations.\n"
+        f"-   **Linking:** Include external links only when the URL is directly present in the provided source data or is an official homepage of a known organization. Do NOT invent links, do NOT use placeholder domains, and do NOT add hypothetical internal links.\n"
         f"-   **Image Inclusion:** Do NOT include any markdown `![alt text](image_path)` syntax for the featured image within the generated content body. The featured image is handled separately. Crucially, do NOT generate any `![alt text](image_path)` markdown for additional images within the content body. The single `featuredImage` is handled separately by the HTML template and should not be re-included.\n"
         f"## Output Structure:\n"
         f"Generate the complete blog post in markdown format. It must start with a metadata block followed by the blog content.\n\n"
@@ -939,7 +1001,7 @@ def generate_content_agent(consolidated_article_data, research_output, transform
         f"3.  **Main Sections:** Follow the `blog_outline` from `research_output`. Expand each section (`##`) and sub-section (`###`). Ensure each section provides substantial information.\n"
         f"4.  **FAQ Section:** Include 5-7 frequently asked questions with detailed, comprehensive answers, related to the topic and incorporating keywords.\n"
         f"5.  **Conclusion:** Summarize key takeaways, provide a forward-looking statement, and a clear call-to-action.\n"
-        f"Do NOT include any introductory or concluding remarks outside the blog content itself (e.g., 'Here is your blog post'). **Do NOT include any bracketed instructions (like `[mention this]`), placeholders (like `example.com`), or any comments intended for me within the output markdown. The entire output must be polished, final content, ready for publication.**"
+        f"Do NOT include any introductory or concluding remarks outside the blog content itself (e.g., 'Here is your blog post'). **Do NOT include placeholders (like `example.com`), or any comments intended for me within the output markdown. The entire output must be polished, final content, ready for publication.**"
     )
 
     try:
@@ -980,12 +1042,16 @@ def generate_content_agent(consolidated_article_data, research_output, transform
         return None
 
 def clean_ai_artifacts(content):
-    """Enhanced cleaning of AI-generated artifacts and placeholders."""
-    # Remove any bracketed instructions/placeholders like [Some Text Here] or [Insert Link Here]
-    content = re.sub(r'\[.*?\]', '', content)
+    """Remove common low-quality artifacts without destroying valid markdown structure."""
+    if not content:
+        return ""
 
     # Remove any stray @ symbols followed by words (e.g., @https, @email), likely from malformed links
     content = re.sub(r'\s*@\S+', '', content)
+    # Remove embedded executable or tracking-heavy HTML blocks from LLM output.
+    content = re.sub(r'(?is)<script.*?>.*?</script>', '', content)
+    content = re.sub(r'(?is)<iframe.*?>.*?</iframe>', '', content)
+    content = re.sub(r'(?is)<object.*?>.*?</object>', '', content)
 
     # Remove example.com or similar placeholder URLs, both in markdown and raw URLs
     placeholder_domains = [
@@ -998,13 +1064,9 @@ def clean_ai_artifacts(content):
         # Raw URLs like https://www.example.com/path
         content = re.sub(rf'https?://(?:www\.)?{re.escape(domain)}\S*', '', content, flags=re.IGNORECASE)
 
-    # Remove any remaining AI comments or instructions that might slip through
+    # Remove common AI wrapper lines while preserving normal prose.
     ai_patterns = [
-        r'(?i)note:.*?(?=\n|$)',
-        r'(?i)important:.*?(?=\n|$)',
-        r'(?i)remember to.*?(?=\n|$)',
-        r'(?i)please.*?(?=\n|$)',
-        r'(?i)you should.*?(?=\n|$)',
+        r'(?im)^\s*(?:here(?:\'s| is)\s+(?:your|the)\s+blog\s+post|this\s+is\s+the\s+generated\s+content)\s*:?\s*$',
         r'<!--.*?-->', # HTML comments
         r'/\*.*?\*/',   # CSS/JS comments
     ]
@@ -1085,12 +1147,14 @@ def markdown_to_html(markdown_text, main_featured_image_filepath=None, main_feat
 
     # Apply aggressive cleanup before markdown conversion
     html_text = clean_ai_artifacts(html_text)
+    # Escape any raw HTML so only generated template tags remain executable.
+    html_text = html.escape(html_text, quote=False)
 
     # Convert headings (order matters: h3 before h2 before h1 to prevent partial matches)
-    html_text = re.sub(r'###\s*(.*)', r'<h3>\1</h3>', html_text)
-    html_text = re.sub(r'##\s*(.*)', r'<h2>\1</h2>', html_text)
+    html_text = re.sub(r'###\s*(.*)', lambda m: f'<h3>{m.group(1).strip()}</h3>', html_text)
+    html_text = re.sub(r'##\s*(.*)', lambda m: f'<h2>{m.group(1).strip()}</h2>', html_text)
     # H1 is assumed to be handled by the template based on metadata, so it's stripped if found in content body.
-    html_text = re.sub(r'#\s*(.*)', r'<h1>\1</h1>', html_text) # Catch any H1s not stripped by metadata parser
+    html_text = re.sub(r'#\s*(.*)', lambda m: f'<h1>{m.group(1).strip()}</h1>', html_text) # Catch any H1s not stripped by metadata parser
 
     # Bold and Italic
     html_text = re.sub(r'\*\*\*(.*?)\*\*\*', r'<strong><em>\1</em></strong>', html_text) # Bold Italic
@@ -1098,21 +1162,21 @@ def markdown_to_html(markdown_text, main_featured_image_filepath=None, main_feat
     html_text = re.sub(r'_(.*?)_', r'<em>\1</em>', html_text) # Italic (underscores)
     html_text = re.sub(r'\*(.*?)\*', r'<em>\1</em>', html_text) # Italic (asterisks)
 
-    # Lists (unordered and ordered) - process list items first, then wrap in ul/ol
-    html_text = re.sub(r'^\s*([-*]|\d+\.)\s+(.*)$', r'<li>\2</li>', html_text, flags=re.MULTILINE)
+    # Lists (unordered and ordered)
+    html_text = re.sub(
+        r'^\s*([-*]|\d+\.)\s+(.*)$',
+        lambda m: f'<li data-list-type="{"ol" if m.group(1).endswith(".") else "ul"}">{m.group(2)}</li>',
+        html_text,
+        flags=re.MULTILINE
+    )
 
-    # Wrap consecutive <li> items into <ul> or <ol>
-    # This is a basic approach and might not handle nested lists or complex markdown lists perfectly.
-    # It assumes all lists are at the top level or are correctly separated by non-list content.
     def wrap_lists(match):
-        list_items_html = match.group(0)
-        if re.search(r'<li>\s*\d+\.', list_items_html): # Check for ordered list pattern (digit followed by dot)
-            return f'<ol>{list_items_html}</ol>'
-        else: # Assume unordered
-            return f'<ul>{list_items_html}</ul>'
+        block = match.group(0)
+        list_type = "ol" if 'data-list-type="ol"' in block else "ul"
+        block = re.sub(r'\sdata-list-type="(?:ul|ol)"', '', block)
+        return f'<{list_type}>{block}</{list_type}>'
 
-    # Apply this regex to sections of only <li> tags
-    html_text = re.sub(r'(<li>.*?</li>\s*)+', wrap_lists, html_text, flags=re.DOTALL)
+    html_text = re.sub(r'(<li\s+data-list-type="(?:ul|ol)">.*?</li>\s*)+', wrap_lists, html_text, flags=re.DOTALL)
 
 
     # Images - this is where we inject Base64 if it's the specific transformed image
@@ -1124,18 +1188,24 @@ def markdown_to_html(markdown_text, main_featured_image_filepath=None, main_feat
         # Use os.path.basename to compare just the filename part, as the agent might give a full path
         if main_featured_image_filepath and os.path.basename(src_url) == os.path.basename(main_featured_image_filepath):
             logger.info(f"Replacing markdown image link '{src_url}' with Base64 data URI for in-content display.")
-            return f'<img src="{main_featured_image_b64_data_uri}" alt="{alt_text}" class="in-content-image">'
+            safe_alt_text = alt_text.replace('"', '&quot;')
+            safe_src = sanitize_external_url(main_featured_image_b64_data_uri, allow_data=True)
+            return f'<img src="{safe_src}" alt="{safe_alt_text}" class="in-content-image">'
         else:
-            # For other images (e.g., external ones generated by LLM), keep the original URL
-            # Ensure the alt text is escaped to prevent breaking HTML attributes
-            escaped_alt_text = alt_text.replace('"', '"') # Use " for attribute safety
-            return f'<img src="{src_url}" alt="{escaped_alt_text}" class="in-content-image">'
+            safe_alt_text = alt_text.replace('"', '&quot;')
+            safe_src = sanitize_external_url(src_url)
+            return f'<img src="{safe_src}" alt="{safe_alt_text}" class="in-content-image">'
 
     html_text = re.sub(r'!\[(.*?)\]\((.*?)\)', image_replacer, html_text)
 
 
     # Links
-    html_text = re.sub(r'\[(.*?)\]\((.*?)\)', r'<a href="\2" target="_blank" rel="noopener noreferrer">\1</a>', html_text)
+    def link_replacer(match):
+        text = match.group(1)
+        href = sanitize_external_url(match.group(2))
+        return f'<a href="{href}" target="_blank" rel="noopener noreferrer">{text}</a>'
+
+    html_text = re.sub(r'\[(.*?)\]\((.*?)\)', link_replacer, html_text)
 
     # Paragraphs (wrap blocks of text not already wrapped by other block-level elements)
     lines = html_text.split('\n')
@@ -1185,15 +1255,21 @@ def generate_enhanced_html_template(title, description, keywords, image_url_for_
                                   category, article_url_for_disclaimer, published_date):
     """Generate enhanced HTML template with better styling and comprehensive SEO elements."""
 
-    # Escape special characters for HTML attributes (e.g., in meta tags, alt text)
-    escaped_title_html = title.replace('&', '&').replace('"', '"').replace("'", '')
-    escaped_description_html = description.replace('&', '&').replace('"', '"').replace("'", '')
+    escaped_title_html = html.escape(title or "", quote=True)
+    escaped_description_html = html.escape(description or "", quote=True)
+    escaped_keywords_html = html.escape(keywords or "", quote=True)
+    escaped_title_text = html.escape(title or "", quote=False)
+    escaped_category_text = html.escape((category or "general").upper(), quote=False)
+
+    safe_article_url = sanitize_external_url(article_url_for_disclaimer)
+    safe_image_url_for_seo = sanitize_external_url(image_url_for_seo, allow_data=True)
+    safe_image_src_for_html_body = sanitize_external_url(image_src_for_html_body, allow_data=True)
 
     # Use json.dumps to get correctly escaped strings for JSON values.
     # We then slice [1:-1] to remove the outer quotes added by json.dumps,
     # as the f-string already provides them for the JSON-LD structure.
-    json_safe_title = json.dumps(title)[1:-1]
-    json_safe_description = json.dumps(description)[1:-1]
+    json_safe_title = json.dumps(title or "")[1:-1]
+    json_safe_description = json.dumps(description or "")[1:-1]
 
     # Enhanced structured data (JSON-LD)
     structured_data = f"""
@@ -1202,7 +1278,7 @@ def generate_enhanced_html_template(title, description, keywords, image_url_for_
       "@context": "https://schema.org",
       "@type": "NewsArticle",
       "headline": "{json_safe_title}",
-      "image": ["{image_url_for_seo}"],
+      "image": ["{safe_image_url_for_seo}"],
       "datePublished": "{published_date}T00:00:00Z",
       "dateModified": "{published_date}T00:00:00Z",
       "articleSection": "{category.capitalize()}",
@@ -1215,12 +1291,12 @@ def generate_enhanced_html_template(title, description, keywords, image_url_for_
         "name": "Your Publication Name",
         "logo": {{
           "@type": "ImageObject",
-          "url": "{image_url_for_seo}"
+          "url": "{safe_image_url_for_seo}"
         }}
       }},
       "mainEntityOfPage": {{
         "@type": "WebPage",
-        "@id": "{article_url_for_disclaimer}"
+        "@id": "{safe_article_url}"
       }},
       "description": "{json_safe_description}"
     }}
@@ -1379,23 +1455,23 @@ def generate_enhanced_html_template(title, description, keywords, image_url_for_
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{escaped_title_html}</title>
     <meta name="description" content="{escaped_description_html}">
-    <meta name="keywords" content="{keywords}">
+    <meta name="keywords" content="{escaped_keywords_html}">
     <meta name="robots" content="index, follow">
     <meta name="author" content="AI Content Creator">
 
     <!-- Open Graph / Facebook -->
     <meta property="og:type" content="article">
-    <meta property="og:url" content="{article_url_for_disclaimer}">
+    <meta property="og:url" content="{safe_article_url}">
     <meta property="og:title" content="{escaped_title_html}">
     <meta property="og:description" content="{escaped_description_html}">
-    <meta property="og:image" content="{image_url_for_seo}">
+    <meta property="og:image" content="{safe_image_url_for_seo}">
 
     <!-- Twitter -->
     <meta property="twitter:card" content="summary_large_image">
-    <meta property="twitter:url" content="{article_url_for_disclaimer}">
+    <meta property="twitter:url" content="{safe_article_url}">
     <meta property="twitter:title" content="{escaped_title_html}">
     <meta property="twitter:description" content="{escaped_description_html}">
-    <meta property="twitter:image" content="{image_url_for_seo}">
+    <meta property="twitter:image" content="{safe_image_url_for_seo}">
 
     {structured_data}
     {html_styles}
@@ -1403,20 +1479,57 @@ def generate_enhanced_html_template(title, description, keywords, image_url_for_
 <body>
     <div class="container">
         <div class="article-header">
-            <span class="category-tag">{category.upper()}</span>
-            <h1>{title}</h1>
-            {f'<img src="{image_src_for_html_body}" alt="{escaped_title_html}" class="featured-image">' if image_src_for_html_body else ''}
+            <span class="category-tag">{escaped_category_text}</span>
+            <h1>{escaped_title_text}</h1>
+            {f'<img src="{safe_image_src_for_html_body}" alt="{escaped_title_html}" class="featured-image">' if image_src_for_html_body else ''}
         </div>
         <div class="article-content">
             {html_blog_content}
         </div>
         <div class="source-link">
-            <p><strong>Disclaimer:</strong> This article was generated by an AI content creation system, synthesizing information from multiple sources. It may contain fictional details and external links for illustrative purposes.</p>
-            <p>A primary source contributing to this content can be found here: <a href="{article_url_for_disclaimer}" target="_blank" rel="noopener noreferrer">{article_url_for_disclaimer}</a></p>
+            <p><strong>Disclaimer:</strong> This article was generated with AI assistance and reviewed by automated quality checks before publishing.</p>
+            <p>A primary source contributing to this content can be found here: <a href="{safe_article_url}" target="_blank" rel="noopener noreferrer">{safe_article_url}</a></p>
         </div>
     </div>
 </body>
 </html>"""
+
+def extract_post_metadata_from_html(html_content):
+    """Extract title and label candidates from generated HTML."""
+    title = "Generated Blog Post"
+    labels = []
+
+    title_match = re.search(r'<title>(.*?)</title>', html_content, re.IGNORECASE | re.DOTALL)
+    if title_match:
+        title = html.unescape(title_match.group(1).strip())
+
+    keywords_match = re.search(
+        r'<meta\s+name=["\']keywords["\']\s+content=["\'](.*?)["\']',
+        html_content,
+        re.IGNORECASE | re.DOTALL
+    )
+    if keywords_match:
+        raw_keywords = html.unescape(keywords_match.group(1))
+        for part in raw_keywords.split(','):
+            cleaned = part.strip().replace('_', ' ')
+            if cleaned:
+                labels.append(cleaned)
+
+    category_match = re.search(r'<span class="category-tag">(.*?)</span>', html_content, re.IGNORECASE | re.DOTALL)
+    if category_match:
+        category = html.unescape(category_match.group(1).strip()).lower()
+        if category:
+            labels.append(category)
+
+    deduped_labels = []
+    seen = set()
+    for label in labels:
+        normalized = label.lower()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            deduped_labels.append(normalized)
+
+    return title, deduped_labels
 
 # --- MODIFIED post_to_blogger function (to accept UserCredentials) ---
 def post_to_blogger(html_file_path, blog_id, blogger_user_credentials):
@@ -1434,43 +1547,10 @@ def post_to_blogger(html_file_path, blog_id, blogger_user_credentials):
         with open(html_file_path, 'r', encoding='utf-8') as f:
             full_html_content = f.read()
 
-        # Enhanced metadata parsing with more detailed logging
-        logger.info("Starting metadata parsing from HTML file...")
-        
-        # First try to find metadata in the HTML content
-        metadata_match = re.search(r"title:\s*(.*?)\n.*?tags:\s*\[(.*?)\]", full_html_content, re.DOTALL | re.IGNORECASE)
-        post_title = "Generated Blog Post"
-        post_labels = [] # Initialize here
-
-        if metadata_match:
-            post_title = metadata_match.group(1).strip()
-            tags_str = metadata_match.group(2).strip()
-            # Parse tags from the string [tag1, tag2]
-            post_labels = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
-            logger.info(f"Found metadata in HTML content:")
-            logger.info(f"Title: {post_title}")
-            logger.info(f"Tags: {post_labels}")
-            
-            # Also grab categories if you want them as labels
-            categories_match = re.search(r"categories:\s*\[(.*?)\]", full_html_content, re.DOTALL | re.IGNORECASE)
-            if categories_match:
-                categories_str = categories_match.group(1).strip()
-                parsed_categories = [cat.strip() for cat in categories_str.split(',') if cat.strip()]
-                post_labels.extend(parsed_categories)
-                logger.info(f"Categories found: {parsed_categories}")
-                logger.info(f"Combined labels after adding categories: {post_labels}")
-        else:
-            logger.warning("Could not find metadata block in HTML content. Attempting to extract from H1...")
-            h1_match = re.search(r'<h1>(.*?)</h1>', full_html_content, re.IGNORECASE | re.DOTALL)
-            if h1_match:
-                post_title = h1_match.group(1).strip()
-                logger.info(f"Extracted title from H1: {post_title}")
-            else:
-                logger.warning("Could not find H1 tag either. Using default title.")
-
-        # Ensure unique labels and clean them
-        post_labels = list(set([label.strip().lower() for label in post_labels if label.strip()]))
-        logger.info(f"Final cleaned labels to send to Blogger: {post_labels}")
+        logger.info("Extracting metadata from generated HTML...")
+        post_title, post_labels = extract_post_metadata_from_html(full_html_content)
+        logger.info(f"Resolved post title: {post_title}")
+        logger.info(f"Resolved post labels: {post_labels}")
 
         # If no labels were found, add some default ones based on the title
         if not post_labels:
@@ -1486,11 +1566,12 @@ def post_to_blogger(html_file_path, blog_id, blogger_user_credentials):
             'title': post_title,
             'content': full_html_content,
             'labels': post_labels,
-            'status': 'LIVE'
+            'status': BLOGGER_POST_STATUS
         }
         logger.info(f"Preparing Blogger post with:")
         logger.info(f"Title: {post_title}")
         logger.info(f"Labels: {post_labels}")
+        logger.info(f"Status: {BLOGGER_POST_STATUS}")
         logger.info(f"Content length: {len(full_html_content)} characters")
 
         logger.info(f"Attempting to insert blog post to Blogger: '{post_title}' with labels: {post_labels}...")
@@ -1540,33 +1621,19 @@ def save_blog_post(consolidated_topic_for_fallback, generated_markdown_content, 
 
     # Safe fallback for description, ensuring it's not too long and doesn't contain quotes
     description_fallback = f"A comprehensive look at the latest news in {category} related to '{title}'."
-    # CORRECTED LINE: Ensures single quotes are correctly escaped for HTML attributes
-    description = metadata.get('description', description_fallback).replace('&', '&').replace('"', '"').replace("'", "")[:155] # Max 155 chars recommended and HTML escape quotes
+    description = metadata.get('description', description_fallback).replace('\n', ' ').replace('\r', ' ').strip()[:155]
 
-    # Ensure keywords are comma-separated and clean
-    keywords_from_meta = metadata.get('tags', '').replace(', ', ',').replace(' ', '_')
-    if not keywords_from_meta: # Fallback if agent didn't provide tags
-        keywords = ','.join([category, 'news', 'latest', sanitize_filename(title)[:30]])
+    parsed_tags = parse_metadata_list_field(metadata.get('tags', ''))
+    if not parsed_tags: # Fallback if agent didn't provide tags
+        keywords = ', '.join([category, 'news', 'latest', sanitize_filename(title)[:30]])
     else:
-        keywords = keywords_from_meta.lower() # Ensure lowercase for consistency
+        keywords = ', '.join(parsed_tags).lower()
 
     # Use the Base64 URI for the main image in the HTML body
     image_src_for_html_body = transformed_image_b64 if transformed_image_b64 else ''
 
-    # Use the file path for structured data and OG tags (recommended for SEO).
-    # NOTE: For public blogs, this should ideally be a publicly accessible URL,
-    # not a local file path. If you upload to Blogger, retrieve that public URL.
-    # For now, it will be the local path which will not work for external crawlers,
-    # or an empty string if no image is present.
-    image_url_for_seo = image_src_for_html_body # Fallback to base64 for SEO metadata if no public URL available
-    if transformed_image_filepath and transformed_image_filepath != 'None':
-         # If you had a mechanism to upload to Blogger's image hosting and get a URL,
-         # you would replace this with the *public URL*. For this script, it's a local file.
-         # An alternative is to use the Base64 URI here, though less ideal for crawlers.
-         image_url_for_seo = '' # Set to empty to avoid local paths in public SEO fields
-         logger.warning("For optimal SEO, 'image_url_for_seo' should be a publicly accessible URL. Currently it is left blank as the script doesn't upload images to a public host.")
-         logger.warning("You may need to manually update the og:image, twitter:image, and JSON-LD image URL in Blogger after publishing.")
-
+    # Until image upload URL is integrated, use same inline source for social metadata.
+    image_url_for_seo = image_src_for_html_body
 
     published_date = metadata.get('date', datetime.now().strftime('%Y-%m-%d'))
 
@@ -1625,7 +1692,12 @@ def main():
         "bbc.com/news", "cnn.com", "nytimes.com"
     ]
 
-    for category in CATEGORIES:
+    categories_for_run = CATEGORIES[:]
+    random.shuffle(categories_for_run)
+    categories_for_run = categories_for_run[:min(MAX_CATEGORIES_PER_RUN, len(categories_for_run))]
+    logger.info(f"Selected categories for this run: {categories_for_run}")
+
+    for category in categories_for_run:
         logger.info(f"\n--- Starting processing for category: [{category.upper()}] ---")
 
         raw_articles = fetch_gnews_articles(category, max_articles_to_fetch=NUM_SOURCE_ARTICLES_TO_AGGREGATE)
@@ -1695,10 +1767,16 @@ def main():
                     continue
             else:
                 logger.warning("GEMINI_API_KEY is not set. Skipping AI content generation. Only image processing and basic HTML saving will occur (if possible).")
-                # Adjusted for proper escaping for placeholder description
+                placeholder_description = (
+                    consolidated_description
+                    .replace('\n', ' ')
+                    .replace('\r', ' ')
+                    .strip()[:155]
+                    .replace("'", "")
+                )
                 generated_blog_markdown = (
                     f"title: {consolidated_topic}\n"
-                    f"description: {consolidated_description.replace('"', '"').replace('\\n', ' ').strip()[:155].replace("'", "")}\n"
+                    f"description: {placeholder_description}\n"
                     f"date: {datetime.now().strftime('%Y-%m-%d')}\n"
                     f"categories: [{category}]\n"
                     f"tags: [{category}, news]\n"
